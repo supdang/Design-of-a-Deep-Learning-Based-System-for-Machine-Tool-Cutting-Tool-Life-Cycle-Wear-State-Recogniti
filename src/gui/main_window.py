@@ -63,6 +63,10 @@ class TrainingWorker(QThread):
             num_epochs = self.config.get('num_epochs', ModelConfig.NUM_EPOCHS)
             learning_rate = self.config.get('learning_rate', ModelConfig.LEARNING_RATE)
             patience = self.config.get('patience', ModelConfig.PATIENCE)
+            
+            # 断点配置
+            checkpoint_path = self.config.get('checkpoint_path', None)
+            resume_from_checkpoint = self.config.get('resume_from_checkpoint', False)
 
             # 检查设备类型
             device_type = str(self.classifier.device)
@@ -92,12 +96,40 @@ class TrainingWorker(QThread):
                 torch.cuda.empty_cache()
 
             # 训练循环
-            for epoch in range(num_epochs):
+            best_val_acc = 0.0
+            no_improve_epochs = 0
+            
+            # 从断点恢复训练
+            start_epoch = 0
+            best_epoch = 0
+            
+            if resume_from_checkpoint and checkpoint_path and Path(checkpoint_path).exists():
+                logger.info(f"从断点 {checkpoint_path} 恢复训练")
+                start_epoch, best_epoch, no_improve_epochs = self.classifier.load_checkpoint(checkpoint_path)
+            
+            # 如果没有从断点恢复，初始化训练状态
+            if start_epoch == 0:
+                best_epoch = 0
+                no_improve_epochs = 0
+
+            total_epochs = num_epochs
+
+            logger.info(f"开始训练，从第 {start_epoch + 1} 轮开始，总共 {total_epochs} 轮")
+
+            for epoch in range(start_epoch, total_epochs):
+                # 检查是否需要停止
                 if not self._is_running:
+                    logger.info("训练被用户中断")
                     break
 
                 # 训练一个epoch
                 train_loss, train_acc = self._train_epoch(train_loader)
+                
+                # 检查是否需要停止（在训练后再次检查）
+                if not self._is_running:
+                    logger.info("训练被用户中断")
+                    break
+
                 val_loss, val_acc = self._validate(val_loader)
 
                 # 每个epoch后清理缓存
@@ -110,8 +142,27 @@ class TrainingWorker(QThread):
                 )
 
                 # 检查早停
-                if epoch > patience and val_acc < 0.5:
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_epoch = epoch
+                    no_improve_epochs = 0
+                else:
+                    no_improve_epochs += 1
+                    
+                if no_improve_epochs >= patience:
+                    logger.info(f"早停触发，最佳验证准确率: {best_val_acc:.4f} at epoch {best_epoch}")
                     break
+
+                # 保存断点（如果指定了断点路径）
+                if checkpoint_path:
+                    self.classifier.save_checkpoint(
+                        file_path=checkpoint_path,
+                        optimizer_state=self.classifier.optimizer.state_dict(),
+                        scheduler_state=self.classifier.scheduler.state_dict() if self.classifier.scheduler else None,
+                        epoch=epoch,
+                        best_epoch=best_epoch,
+                        no_improve_epochs=no_improve_epochs
+                    )
 
             # 评估模型
             results = self.classifier.evaluate(self.val_data)
@@ -119,12 +170,25 @@ class TrainingWorker(QThread):
 
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
-                error_msg = "GPU内存严重不足！尝试以下方法：\n1. 减小批量大小（建议≤4）\n2. 减小模型大小（隐藏层≤32）\n3. 关闭其他GPU程序\n4. 切换到CPU模式"
+                error_msg = "GPU内存严重不足！尝试以下方法：
+1. 减小批量大小（建议≤4）
+2. 减小模型大小（隐藏层≤32）
+3. 关闭其他GPU程序
+4. 切换到CPU模式"
                 self.training_error.emit(error_msg)
             else:
                 self.training_error.emit(str(e))
         except Exception as e:
             self.training_error.emit(str(e))
+        finally:
+            # 确保在任何情况下都清理资源
+            if 'cuda' in str(self.classifier.device):
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except:
+                    pass  # 如果GPU清理失败，则忽略
+
 
     def _train_epoch(self, train_loader):
         """训练一个epoch"""
@@ -200,6 +264,8 @@ class TrainingWorker(QThread):
         # 停止时清理内存
         if 'cuda' in str(self.classifier.device):
             torch.cuda.empty_cache()
+            # 同步GPU以确保清理完成
+            torch.cuda.synchronize()
 
 
 class MainWindow(QMainWindow):
@@ -451,6 +517,23 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         layout.addWidget(self.stop_btn)
 
+        # 断点路径选择
+        checkpoint_layout = QHBoxLayout()
+        checkpoint_layout.addWidget(QLabel("断点路径:"))
+        self.checkpoint_path_edit = QLineEdit()
+        self.checkpoint_path_edit.setPlaceholderText("输入断点保存路径（可选）")
+        checkpoint_layout.addWidget(self.checkpoint_path_edit)
+        
+        browse_checkpoint_btn = QPushButton("浏览...")
+        browse_checkpoint_btn.clicked.connect(self.browse_checkpoint_path)
+        checkpoint_layout.addWidget(browse_checkpoint_btn)
+        
+        layout.addLayout(checkpoint_layout)
+
+        # 断点恢复复选框
+        self.resume_checkbox = QCheckBox("从断点恢复训练")
+        layout.addWidget(self.resume_checkbox)
+
         # 训练进度
         self.progress_bar = QProgressBar()
         layout.addWidget(self.progress_bar)
@@ -695,6 +778,14 @@ class MainWindow(QMainWindow):
             }}
         """)
 
+    def browse_checkpoint_path(self):
+        """浏览断点路径"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "选择断点保存路径", "", "PyTorch Checkpoints (*.pth);;All Files (*.*)"
+        )
+        if file_path:
+            self.checkpoint_path_edit.setText(file_path)
+
     def browse_data_path(self):
         """浏览数据路径"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -923,6 +1014,15 @@ class MainWindow(QMainWindow):
                 'patience': ModelConfig.PATIENCE
             }
 
+            # 添加断点配置
+            checkpoint_path = self.checkpoint_path_edit.text().strip()
+            if checkpoint_path:
+                training_config['checkpoint_path'] = checkpoint_path
+                training_config['resume_from_checkpoint'] = self.resume_checkbox.isChecked()
+            else:
+                training_config['checkpoint_path'] = None
+                training_config['resume_from_checkpoint'] = False
+
             # 启动训练线程
             self.training_worker = TrainingWorker(
                 self.classifier,
@@ -1041,9 +1141,26 @@ class MainWindow(QMainWindow):
 
     def stop_training(self):
         """停止训练"""
-        if self.training_worker:
+        if self.training_worker and self.training_worker.isRunning():
+            # 停止训练工作线程
             self.training_worker.stop()
-            self.training_worker.wait()
+            # 等待线程结束，最多等待10秒
+            if not self.training_worker.wait(10000):  # 10秒超时
+                logger.warning("训练线程未能在10秒内停止，尝试强制终止")
+                # 强制终止线程（如果wait失败）
+                try:
+                    self.training_worker.terminate()
+                except:
+                    pass  # 如果terminate不可用，则忽略
+
+        # 清理GPU内存
+        if hasattr(self, 'classifier') and self.classifier is not None:
+            if 'cuda' in str(self.classifier.device):
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except:
+                    pass  # 如果GPU清理失败，则忽略
 
         self.train_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
