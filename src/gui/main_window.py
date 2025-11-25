@@ -101,6 +101,10 @@ class TrainingWorker(QThread):
             # 清理内存
             if 'cuda' in device_type:
                 torch.cuda.empty_cache()
+            else:
+                # CPU模式下也进行垃圾回收
+                import gc
+                gc.collect()
 
             # 训练循环
             best_val_acc = 0.0
@@ -109,13 +113,17 @@ class TrainingWorker(QThread):
             # 从断点恢复训练
             start_epoch = 0
             best_epoch = 0
+            no_improve_epochs = 0
             
             if resume_from_checkpoint and checkpoint_path and Path(checkpoint_path).exists():
                 logger.info(f"从断点 {checkpoint_path} 恢复训练")
                 start_epoch, best_epoch, no_improve_epochs = self.classifier.load_checkpoint(checkpoint_path)
-            
-            # 如果没有从断点恢复，初始化训练状态
-            if start_epoch == 0:
+                # 注意：从断点恢复时，start_epoch是已完成的epoch，下一轮应从start_epoch+1开始
+                # 所以训练循环中会使用start_epoch作为起始值，实际训练从start_epoch+1开始
+                logger.info(f"断点恢复状态 - 当前轮数: {start_epoch}, 最佳轮数: {best_epoch}, 无改善轮数: {no_improve_epochs}")
+            else:
+                # 如果不是从断点恢复，初始化训练状态
+                start_epoch = 0
                 best_epoch = 0
                 no_improve_epochs = 0
 
@@ -177,6 +185,10 @@ class TrainingWorker(QThread):
                 if 'cuda' in device_type:
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()  # 确保GPU操作完成
+                else:
+                    # CPU模式下进行垃圾回收
+                    import gc
+                    gc.collect()
 
                 # 发送进度信号
                 self.progress_updated.emit(
@@ -222,6 +234,13 @@ class TrainingWorker(QThread):
                 error_msg = ("显存使用率过高，为保护硬件安全，训练已停止！\n"
                             "请减小批量大小或切换到CPU模式继续训练。")
                 self.training_error.emit(error_msg)
+            elif "not enough memory" in str(e) or "DefaultCPUAllocator" in str(e):
+                error_msg = ("CPU内存严重不足！尝试以下方法：\n"
+                            "1. 减小批量大小（建议≤2）\n"
+                            "2. 减少训练数据量\n"
+                            "3. 关闭其他占用内存的程序\n"
+                            "4. 增加系统虚拟内存")
+                self.training_error.emit(error_msg)
             else:
                 self.training_error.emit(str(e))
         except Exception as e:
@@ -234,6 +253,13 @@ class TrainingWorker(QThread):
                     torch.cuda.synchronize()
                 except:
                     pass  # 如果GPU清理失败，则忽略
+            else:
+                # CPU模式下也进行垃圾回收
+                try:
+                    import gc
+                    gc.collect()
+                except:
+                    pass  # 如果垃圾回收失败，则忽略
 
 
     def _train_epoch(self, train_loader):
@@ -275,6 +301,11 @@ class TrainingWorker(QThread):
                         
                 except Exception as e:
                     logger.warning(f"训练过程中的显存监控失败: {str(e)}")
+            else:
+                # CPU模式下，定期清理内存
+                if batch_idx % 10 == 0:
+                    import gc
+                    gc.collect()
 
             data, target = data.to(self.classifier.device), target.to(self.classifier.device)
 
@@ -316,6 +347,11 @@ class TrainingWorker(QThread):
                 if not self._is_running:
                     logger.info("训练epoch被用户中断")
                     break
+            
+            # CPU模式下更频繁地清理内存
+            if 'cuda' not in str(self.classifier.device) and batch_idx % 20 == 0:
+                import gc
+                gc.collect()
 
         avg_loss = total_loss / len(train_loader)
         avg_acc = total_correct / total_samples
@@ -353,6 +389,11 @@ class TrainingWorker(QThread):
                             
                     except Exception as e:
                         logger.warning(f"验证过程中的显存监控失败: {str(e)}")
+                else:
+                    # CPU模式下，定期清理内存
+                    if batch_idx % 10 == 0:
+                        import gc
+                        gc.collect()
 
                 data, target = data.to(self.classifier.device), target.to(self.classifier.device)
 
@@ -377,6 +418,11 @@ class TrainingWorker(QThread):
                     if not self._is_running:
                         logger.info("验证被用户中断")
                         break
+                
+                # CPU模式下更频繁地清理内存
+                if 'cuda' not in str(self.classifier.device) and batch_idx % 20 == 0:
+                    import gc
+                    gc.collect()
 
         avg_loss = total_loss / len(val_loader)
         avg_acc = total_correct / total_samples
@@ -393,6 +439,13 @@ class TrainingWorker(QThread):
                 torch.cuda.synchronize()  # 同步GPU以确保清理完成
             except Exception as e:
                 logger.error(f"停止时清理GPU缓存失败: {str(e)}")
+        else:
+            # CPU模式下也进行垃圾回收
+            try:
+                import gc
+                gc.collect()
+            except Exception as e:
+                logger.error(f"停止时清理CPU内存失败: {str(e)}")
 
 
 class MainWindow(QMainWindow):
