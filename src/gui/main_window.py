@@ -54,12 +54,12 @@ class TrainingWorker(QThread):
         self.val_data = val_data
         self.config = config
         self._is_running = True
+        self.current_batch_size = config.get('batch_size', ModelConfig.BATCH_SIZE)  # 添加当前批次大小属性
 
     def run(self):
         """执行训练"""
         try:
             # 设置训练参数
-            batch_size = self.config.get('batch_size', ModelConfig.BATCH_SIZE)
             num_epochs = self.config.get('num_epochs', ModelConfig.NUM_EPOCHS)
             learning_rate = self.config.get('learning_rate', ModelConfig.LEARNING_RATE)
             patience = self.config.get('patience', ModelConfig.PATIENCE)
@@ -72,24 +72,31 @@ class TrainingWorker(QThread):
             device_type = str(self.classifier.device)
             logger.info(f"使用设备: {device_type}")
 
+            # 检查GPU内存并自动调整参数
             if 'cuda' in device_type:
                 gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)  # GB
                 logger.info(f"检测到GPU内存: {gpu_mem:.2f} GB")
 
                 # 根据GPU内存自动调整batch size
                 if gpu_mem < 4.5:
-                    batch_size = min(batch_size, 4)
-                    logger.warning(f"GPU内存严重不足，自动减小batch size到: {batch_size}")
+                    self.current_batch_size = min(self.current_batch_size, 2)
+                    logger.warning(f"GPU内存严重不足，自动减小batch size到: {self.current_batch_size}")
                 elif gpu_mem < 6:
-                    batch_size = min(batch_size, 8)
-                    logger.warning(f"GPU内存不足，自动减小batch size到: {batch_size}")
+                    self.current_batch_size = min(self.current_batch_size, 4)
+                    logger.warning(f"GPU内存不足，自动减小batch size到: {self.current_batch_size}")
+                else:
+                    self.current_batch_size = min(self.current_batch_size, 8)  # 限制最大batch size
+            else:
+                # CPU模式下也限制batch size
+                self.current_batch_size = min(self.current_batch_size, 4)
 
             # 创建数据加载器
             train_dataset = ToolWearDataset(self.train_data[0], self.train_data[1])
             val_dataset = ToolWearDataset(self.val_data[0], self.val_data[1])
 
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+            # 动态创建数据加载器，使用调整后的batch size
+            train_loader = DataLoader(train_dataset, batch_size=self.current_batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=self.current_batch_size, shuffle=False)
 
             # 清理内存
             if 'cuda' in device_type:
@@ -121,6 +128,35 @@ class TrainingWorker(QThread):
                 if not self._is_running:
                     logger.info("训练被用户中断")
                     break
+
+                # 检查显存使用情况
+                if 'cuda' in device_type:
+                    try:
+                        # 监控显存使用情况
+                        allocated_memory = torch.cuda.memory_allocated(0) / (1024 ** 3)
+                        cached_memory = torch.cuda.memory_reserved(0) / (1024 ** 3)
+                        memory_utilization = allocated_memory / (torch.cuda.get_device_properties(0).total_memory / (1024 ** 3))
+                        
+                        # 如果显存使用超过85%，尝试减少batch size
+                        if memory_utilization > 0.85:
+                            new_batch_size = max(1, self.current_batch_size // 2)
+                            if new_batch_size != self.current_batch_size:
+                                logger.warning(f"显存使用率过高 ({memory_utilization:.2%})，将batch size从 {self.current_batch_size} 减少到 {new_batch_size}")
+                                self.current_batch_size = new_batch_size
+                                
+                                # 重建数据加载器
+                                train_loader = DataLoader(train_dataset, batch_size=self.current_batch_size, shuffle=True)
+                                val_loader = DataLoader(val_dataset, batch_size=self.current_batch_size, shuffle=False)
+                                
+                                # 清理缓存
+                                torch.cuda.empty_cache()
+                        
+                        # 如果显存使用超过95%，直接停止训练
+                        if memory_utilization > 0.95:
+                            raise RuntimeError("显存使用率过高，为保护硬件安全，训练已停止")
+                        
+                    except Exception as e:
+                        logger.warning(f"显存监控失败: {str(e)}")
 
                 # 训练一个epoch
                 train_loss, train_acc = self._train_epoch(train_loader)
@@ -170,11 +206,15 @@ class TrainingWorker(QThread):
 
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
-                error_msg = "GPU内存严重不足！尝试以下方法：
-1. 减小批量大小（建议≤4）
-2. 减小模型大小（隐藏层≤32）
-3. 关闭其他GPU程序
-4. 切换到CPU模式"
+                error_msg = ("GPU内存严重不足！尝试以下方法：\n"
+                            "1. 减小批量大小（建议≤4）\n"
+                            "2. 减小模型大小（隐藏层≤32）\n"
+                            "3. 关闭其他GPU程序\n"
+                            "4. 切换到CPU模式")
+                self.training_error.emit(error_msg)
+            elif "显存使用率过高" in str(e):
+                error_msg = ("显存使用率过高，为保护硬件安全，训练已停止！\n"
+                            "请减小批量大小或切换到CPU模式继续训练。")
                 self.training_error.emit(error_msg)
             else:
                 self.training_error.emit(str(e))
@@ -199,6 +239,32 @@ class TrainingWorker(QThread):
         total_batches = len(train_loader)  # 先计算总batch数
 
         for batch_idx, (data, target) in enumerate(train_loader):
+            # 检查显存使用情况
+            if 'cuda' in str(self.classifier.device):
+                try:
+                    # 监控显存使用情况
+                    allocated_memory = torch.cuda.memory_allocated(0) / (1024 ** 3)
+                    cached_memory = torch.cuda.memory_reserved(0) / (1024 ** 3)
+                    memory_utilization = allocated_memory / (torch.cuda.get_device_properties(0).total_memory / (1024 ** 3))
+                    
+                    # 如果显存使用超过85%，尝试减少batch size
+                    if memory_utilization > 0.85:
+                        new_batch_size = max(1, self.current_batch_size // 2)
+                        if new_batch_size != self.current_batch_size:
+                            logger.warning(f"训练过程中显存使用率过高 ({memory_utilization:.2%})，将batch size从 {self.current_batch_size} 减少到 {new_batch_size}")
+                            # 由于当前epoch已经开始了，我们只记录这个变化
+                            self.current_batch_size = new_batch_size
+                            
+                            # 清理缓存
+                            torch.cuda.empty_cache()
+                    
+                    # 如果显存使用超过95%，直接停止训练
+                    if memory_utilization > 0.95:
+                        raise RuntimeError("显存使用率过高，为保护硬件安全，训练已停止")
+                        
+                except Exception as e:
+                    logger.warning(f"训练过程中的显存监控失败: {str(e)}")
+
             data, target = data.to(self.classifier.device), target.to(self.classifier.device)
 
             self.classifier.optimizer.zero_grad()
@@ -242,7 +308,26 @@ class TrainingWorker(QThread):
         total_samples = 0
 
         with torch.no_grad():
-            for data, target in val_loader:
+            for batch_idx, (data, target) in enumerate(val_loader):
+                # 检查显存使用情况
+                if 'cuda' in str(self.classifier.device):
+                    try:
+                        # 监控显存使用情况
+                        allocated_memory = torch.cuda.memory_allocated(0) / (1024 ** 3)
+                        cached_memory = torch.cuda.memory_reserved(0) / (1024 ** 3)
+                        memory_utilization = allocated_memory / (torch.cuda.get_device_properties(0).total_memory / (1024 ** 3))
+                        
+                        # 如果显存使用超过90%，发出警告
+                        if memory_utilization > 0.90:
+                            logger.warning(f"验证过程中显存使用率过高 ({memory_utilization:.2%})，建议减小batch size")
+                        
+                        # 如果显存使用超过95%，直接停止训练
+                        if memory_utilization > 0.95:
+                            raise RuntimeError("显存使用率过高，为保护硬件安全，验证已停止")
+                            
+                    except Exception as e:
+                        logger.warning(f"验证过程中的显存监控失败: {str(e)}")
+
                 data, target = data.to(self.classifier.device), target.to(self.classifier.device)
 
                 output = self.classifier.model(data)
@@ -252,6 +337,10 @@ class TrainingWorker(QThread):
                 _, predicted = torch.max(output.data, 1)
                 total_correct += (predicted == target).sum().item()
                 total_samples += target.size(0)
+
+                # GPU清理缓存
+                if batch_idx % 2 == 0 and 'cuda' in str(self.classifier.device):
+                    torch.cuda.empty_cache()
 
         avg_loss = total_loss / len(val_loader)
         avg_acc = total_correct / total_samples
@@ -397,13 +486,16 @@ class MainWindow(QMainWindow):
             if torch.cuda.is_available():
                 gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                 if gpu_mem < 4.5:
-                    self.device_info_label.setText("⚠️ GPU内存严重不足，建议使用CPU或减小模型参数")
+                    self.device_info_label.setText("⚠️ GPU内存严重不足 (< 4.5GB)，强烈建议使用CPU或减小模型参数")
                     self.device_info_label.setStyleSheet("color: #BF616A;")
                 elif gpu_mem < 6:
-                    self.device_info_label.setText("⚠️ GPU内存不足，建议减小批量大小和模型大小")
+                    self.device_info_label.setText("⚠️ GPU内存不足 (4.5-6GB)，建议减小批量大小和模型大小")
                     self.device_info_label.setStyleSheet("color: #EBCB8B;")
+                elif gpu_mem < 8:
+                    self.device_info_label.setText("⚠️ GPU内存一般 (6-8GB)，可正常使用但需注意显存使用")
+                    self.device_info_label.setStyleSheet("color: #88C0D0;")
                 else:
-                    self.device_info_label.setText("GPU内存充足，可使用较大批量和模型")
+                    self.device_info_label.setText("✅ GPU内存充足 (≥8GB)，可使用较大参数进行训练")
                     self.device_info_label.setStyleSheet("color: #A3BE8C;")
             else:
                 self.device_info_label.setText("GPU不可用，请使用CPU")
@@ -533,6 +625,12 @@ class MainWindow(QMainWindow):
         # 断点恢复复选框
         self.resume_checkbox = QCheckBox("从断点恢复训练")
         layout.addWidget(self.resume_checkbox)
+
+        # 保存断点按钮
+        self.save_checkpoint_btn = QPushButton("保存当前断点")
+        self.save_checkpoint_btn.clicked.connect(self.save_current_checkpoint)
+        self.save_checkpoint_btn.setEnabled(False)  # 只在训练过程中启用
+        layout.addWidget(self.save_checkpoint_btn)
 
         # 训练进度
         self.progress_bar = QProgressBar()
@@ -786,6 +884,60 @@ class MainWindow(QMainWindow):
         if file_path:
             self.checkpoint_path_edit.setText(file_path)
 
+    def save_current_checkpoint(self):
+        """保存当前断点"""
+        try:
+            if self.classifier is None:
+                QMessageBox.warning(self, "警告", "没有可保存的模型")
+                return
+
+            # 获取断点路径
+            checkpoint_path = self.checkpoint_path_edit.text().strip()
+            if not checkpoint_path:
+                # 如果没有设置路径，提示用户选择
+                file_path, _ = QFileDialog.getSaveFileName(
+                    self, "选择断点保存路径", "", "PyTorch Checkpoints (*.pth);;All Files (*.*)"
+                )
+                if file_path:
+                    self.checkpoint_path_edit.setText(file_path)
+                    checkpoint_path = file_path
+                else:
+                    return
+
+            # 保存当前断点
+            if hasattr(self.classifier, 'save_checkpoint') and self.classifier.save_checkpoint:
+                # 如果训练器正在运行，获取当前训练状态
+                if self.training_worker and self.training_worker.isRunning():
+                    # 在训练线程中保存断点
+                    current_epoch = getattr(self.training_worker, 'current_epoch', 0)
+                    self.classifier.save_checkpoint(
+                        file_path=checkpoint_path,
+                        optimizer_state=self.classifier.optimizer.state_dict(),
+                        scheduler_state=self.classifier.scheduler.state_dict() if self.classifier.scheduler else None,
+                        epoch=current_epoch,
+                        best_epoch=getattr(self.classifier, 'best_epoch', 0),
+                        no_improve_epochs=getattr(self.classifier, 'no_improve_epochs', 0)
+                    )
+                else:
+                    # 如果训练已经结束或未开始，使用默认参数保存
+                    self.classifier.save_checkpoint(
+                        file_path=checkpoint_path,
+                        optimizer_state=self.classifier.optimizer.state_dict(),
+                        scheduler_state=self.classifier.scheduler.state_dict() if self.classifier.scheduler else None,
+                        epoch=0,
+                        best_epoch=0,
+                        no_improve_epochs=0
+                    )
+
+                QMessageBox.information(self, "成功", f"断点已保存到: {checkpoint_path}")
+                logger.info(f"断点已保存到: {checkpoint_path}")
+            else:
+                QMessageBox.warning(self, "警告", "模型不支持保存断点功能")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存断点失败: {str(e)}")
+            logger.error(f"保存断点失败: {str(e)}")
+
     def browse_data_path(self):
         """浏览数据路径"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -920,6 +1072,24 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "警告", "请先加载数据")
                 return
 
+            # 检查是否有现有的断点文件
+            checkpoint_path = self.checkpoint_path_edit.text().strip()
+            if checkpoint_path and Path(checkpoint_path).exists():
+                reply = QMessageBox.question(
+                    self, "发现断点文件", 
+                    f"检测到断点文件 {checkpoint_path} 已存在，是否从断点继续训练？\n\n"
+                    "选择“是”从断点继续训练，选择“否”重新开始训练。",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    # 用户选择从断点继续训练，勾选复选框
+                    self.resume_checkbox.setChecked(True)
+                else:
+                    # 用户选择重新开始，不勾选复选框
+                    self.resume_checkbox.setChecked(False)
+
             # 获取设备选择
             if self.cpu_radio.isChecked():
                 device = 'cpu'
@@ -930,19 +1100,20 @@ class MainWindow(QMainWindow):
                     gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                     logger.info(f"选择使用GPU进行训练，可用内存: {gpu_mem:.2f} GB")
 
-                    # 4GB GPU专用配置
+                    # 检查GPU内存并提供配置建议
                     if gpu_mem < 4.5:
+                        # 4GB GPU专用配置
                         # 强制设置为4GB GPU安全参数
-                        self.batch_size_spin.setValue(4)
-                        self.hidden_size_spin.setValue(32)
-                        self.epochs_spin.setValue(30)
+                        self.batch_size_spin.setValue(2)
+                        self.hidden_size_spin.setValue(16)
+                        self.epochs_spin.setValue(20)
 
                         reply = QMessageBox.warning(
                             self, "GPU内存严重不足",
                             f"检测到GPU内存非常小 ({gpu_mem:.2f} GB)，已自动设置安全参数：\n"
-                            f"• 批量大小: 4\n"
-                            f"• 隐藏层大小: 32\n"
-                            f"• 训练轮数: 30\n"
+                            f"• 批量大小: 2\n"
+                            f"• 隐藏层大小: 16\n"
+                            f"• 训练轮数: 20\n"
                             f"• LSTM层数: 1\n\n"
                             "请确保关闭所有其他GPU程序（如浏览器、视频播放器等）。\n"
                             "是否继续训练？",
@@ -951,6 +1122,18 @@ class MainWindow(QMainWindow):
                         )
                         if reply == QMessageBox.No:
                             return
+                    elif gpu_mem < 6:
+                        # 6GB GPU配置
+                        if self.batch_size_spin.value() > 4:
+                            reply = QMessageBox.information(
+                                self, "GPU内存不足",
+                                f"检测到GPU内存较小 ({gpu_mem:.2f} GB)，建议将批量大小设置为4或更小以避免显存不足。",
+                                QMessageBox.Ok,
+                                QMessageBox.Ok
+                            )
+                    else:
+                        # 8GB+ GPU配置
+                        logger.info(f"GPU内存充足 ({gpu_mem:.2f} GB)，可使用较大参数")
                 else:
                     QMessageBox.warning(self, "GPU不可用", "CUDA不可用，将自动切换到CPU模式")
                     device = 'cpu'
@@ -1015,7 +1198,6 @@ class MainWindow(QMainWindow):
             }
 
             # 添加断点配置
-            checkpoint_path = self.checkpoint_path_edit.text().strip()
             if checkpoint_path:
                 training_config['checkpoint_path'] = checkpoint_path
                 training_config['resume_from_checkpoint'] = self.resume_checkbox.isChecked()
@@ -1040,6 +1222,7 @@ class MainWindow(QMainWindow):
             # 更新UI状态
             self.train_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
+            self.save_checkpoint_btn.setEnabled(True)  # 启用保存断点按钮
             self.progress_bar.setValue(0)
 
             device_name = "CPU" if device == 'cpu' else "GPU"
@@ -1117,6 +1300,7 @@ class MainWindow(QMainWindow):
             # 更新UI状态
             self.train_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self.save_checkpoint_btn.setEnabled(False)  # 训练完成后禁用保存断点按钮
             self.predict_btn.setEnabled(True)
             self.save_model_btn.setEnabled(True)
 
@@ -1164,6 +1348,7 @@ class MainWindow(QMainWindow):
 
         self.train_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.save_checkpoint_btn.setEnabled(False)  # 停止训练后禁用保存断点按钮
 
         self.status_bar.showMessage("训练已停止")
 
@@ -1447,7 +1632,11 @@ class MainWindow(QMainWindow):
 
             # 退出前清理GPU缓存
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except:
+                    pass  # 如果GPU清理失败，则忽略
 
             event.accept()
         else:
